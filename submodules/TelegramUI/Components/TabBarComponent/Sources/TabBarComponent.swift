@@ -11,6 +11,10 @@ import UIKitRuntimeUtils
 import BundleIconComponent
 import TextBadgeComponent
 
+// MARK: - Debug Mode for Liquid Glass Development
+private let kDebugDualTabBarMode = true  // Set to true to show both native and custom tab bars
+private let kDebugShowOnlyBackgrounds = true  // Set to true to hide tab items, show only backgrounds
+
 public final class TabBarComponent: Component {
     public final class Item: Equatable {
         public let item: UITabBarItem
@@ -80,6 +84,10 @@ public final class TabBarComponent: Component {
         private let contextGestureContainerView: ContextControllerSourceView
         private let nativeTabBar: UITabBar?
         
+        // MARK: - Debug: Second tab bar for comparison (custom Metal impl)
+        private var customBackgroundView: GlassBackgroundView?
+        private var comparisonContainerView: UIView?
+        
         private var itemViews: [AnyHashable: ComponentView<Empty>] = [:]
         private var selectedItemViews: [AnyHashable: ComponentView<Empty>] = [:]
         
@@ -139,17 +147,38 @@ public final class TabBarComponent: Component {
                 self.traitOverrides.horizontalSizeClass = .compact
             }
             
-            self.addSubview(self.contextGestureContainerView)
-            
-            if let nativeTabBar = self.nativeTabBar {
-                self.contextGestureContainerView.addSubview(nativeTabBar)
-                nativeTabBar.delegate = self
-                /*let longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(self.onLongPressGesture(_:)))
-                longPressGesture.delegate = self
-                self.addGestureRecognizer(longPressGesture)*/
-            } else {
+            // MARK: - Debug: Setup dual tab bar comparison mode
+            if kDebugDualTabBarMode {
+                let comparisonContainer = UIView()
+                comparisonContainer.backgroundColor = .clear
+                self.comparisonContainerView = comparisonContainer
+                self.addSubview(comparisonContainer)
+                
+                // Create custom Metal-based glass view for comparison
+                // Temporarily enable custom impl to create this view
+                GlassBackgroundView.useCustomGlassImpl = true
+                let customView = GlassBackgroundView()
+                GlassBackgroundView.useCustomGlassImpl = false
+                self.customBackgroundView = customView
+                comparisonContainer.addSubview(customView)
+                
+                // Add native glass background below for comparison
+                comparisonContainer.addSubview(self.backgroundView)
+                
+                // Add context gesture container on top
+                self.addSubview(self.contextGestureContainerView)
                 self.contextGestureContainerView.addSubview(self.backgroundView)
                 self.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(self.onTapGesture(_:))))
+            } else {
+                self.addSubview(self.contextGestureContainerView)
+                
+                if let nativeTabBar = self.nativeTabBar {
+                    self.contextGestureContainerView.addSubview(nativeTabBar)
+                    nativeTabBar.delegate = self
+                } else {
+                    self.contextGestureContainerView.addSubview(self.backgroundView)
+                    self.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(self.onTapGesture(_:))))
+                }
             }
             
             self.contextGestureContainerView.shouldBegin = { [weak self] point in
@@ -543,6 +572,31 @@ public final class TabBarComponent: Component {
             
             transition.setFrame(view: self.backgroundView, frame: CGRect(origin: CGPoint(), size: size))
             self.backgroundView.update(size: size, cornerRadius: size.height * 0.5, isDark: component.theme.overallDarkAppearance, tintColor: .init(kind: .panel, color: component.theme.chat.inputPanel.inputBackgroundColor.withMultipliedAlpha(0.7)), transition: transition)
+            
+            // MARK: - Debug: Update custom Metal background view for comparison
+            if kDebugDualTabBarMode, let customBackgroundView = self.customBackgroundView, let comparisonContainer = self.comparisonContainerView {
+                // Stack two tab bars vertically for comparison
+                let spacing: CGFloat = 20.0
+                let totalHeight = size.height * 2.0 + spacing
+                
+                // Position comparison container
+                comparisonContainer.frame = CGRect(origin: CGPoint(x: 0, y: -size.height - spacing), size: CGSize(width: size.width, height: totalHeight))
+
+                // Configure custom glass with same settings as native (for apple-to-apple comparison)
+                customBackgroundView.frame = CGRect(origin: CGPoint(x: 0, y: 0), size: size)
+                customBackgroundView.update(size: size, cornerRadius: size.height * 0.5, isDark: component.theme.overallDarkAppearance, tintColor: .init(kind: .panel, color: component.theme.chat.inputPanel.inputBackgroundColor.withMultipliedAlpha(0.7)), transition: transition)
+
+                // Hide tab items in debug mode if configured
+                if kDebugShowOnlyBackgrounds {
+                    for (_, itemView) in self.itemViews {
+                        itemView.view?.isHidden = true
+                    }
+                    for (_, selectedItemView) in self.selectedItemViews {
+                        selectedItemView.view?.isHidden = true
+                    }
+                    self.selectionView.isHidden = true
+                }
+            }
             
             if self.nativeTabBar != nil {
                 let finalSize = CGSize(width: availableSize.width, height: 62.0)

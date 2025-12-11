@@ -6,6 +6,9 @@ import ComponentDisplayAdapters
 import UIKitRuntimeUtils
 import CoreImage
 import AppBundle
+import Metal
+import QuartzCore
+import CoreFoundation
 
 private final class ContentContainer: UIView {
     private let maskContentView: UIView
@@ -325,14 +328,35 @@ public class GlassBackgroundView: UIView {
     }
     
     public private(set) var params: Params?
-        
+    
+    // MARK: - Custom Glass Implementation
     public static var useCustomGlassImpl: Bool = false
     
+    /// Instance-level flag indicating this view was created with custom Metal implementation
+    private let isUsingCustomGlassImpl: Bool
+    
+    // Metal-based glass effect
+    private var metalGlassLayer: CAMetalLayer?
+    private var metalGlassRenderer: MetalGlassRenderer?
+    private var backdropCapturer: BackdropCapturer?
+    
+    // Display link synchronized with CA render server
+    private var displayLink: CADisplayLink?
+    private var needsBackdropCapture: Bool = false
+    
+    // Lifecycle management
+    private var isAppActive: Bool = true
+    
     public override init(frame: CGRect) {
-        if #available(iOS 26.0, *), !GlassBackgroundView.useCustomGlassImpl {
+        // Capture the static flag at init time for this instance
+        let useCustom = GlassBackgroundView.useCustomGlassImpl
+        self.isUsingCustomGlassImpl = useCustom
+
+        if #available(iOS 26.0, *), !useCustom {
+            // Native iOS 26 UIGlassEffect
             self.backgroundNode = nil
             
-            let glassEffect = UIGlassEffect(style: .regular)
+            let glassEffect = UIGlassEffect(style: .clear)
             glassEffect.isInteractive = false
             let nativeView = UIVisualEffectView(effect: glassEffect)
             self.nativeViewClippingContext = ClippingShapeContext(view: nativeView)
@@ -345,15 +369,28 @@ public class GlassBackgroundView: UIView {
             
             self.foregroundView = nil
             self.shadowView = nil
-        } else {
-            let backgroundNode = NavigationBackgroundNode(color: .black, enableBlur: true, customBlurRadius: 8.0)
+        } else if useCustom {
+            // Custom Metal-based glass implementation (iOS 13+)
+            // Uses blur + Metal layer for specular highlights
+            let backgroundNode = NavigationBackgroundNode(color: .clear, enableBlur: false)
             self.backgroundNode = backgroundNode
             self.nativeView = nil
             self.nativeViewClippingContext = nil
             self.nativeParamsView = nil
-            self.foregroundView = UIImageView()
-            
-            self.shadowView = UIImageView()
+            self.foregroundView = nil  // Metal layer replaces foregroundView
+            self.shadowView = nil
+        } else {
+            // Legacy glass implementation (pre-iOS 26)
+            // Uses blur + foregroundView with generated glass image
+            let backgroundNode = NavigationBackgroundNode(color: .clear, enableBlur: false)
+            self.backgroundNode = backgroundNode
+            self.nativeView = nil
+            self.nativeViewClippingContext = nil
+            self.nativeParamsView = nil
+            // self.foregroundView = UIImageView()
+            // self.shadowView = UIImageView()
+            self.foregroundView = nil
+            self.shadowView = nil
         }
         
         self.maskContainerView = UIView()
@@ -383,10 +420,207 @@ public class GlassBackgroundView: UIView {
             foregroundView.mask = self.maskContainerView
         }
         self.addSubview(self.contentContainer)
+        
+        // Initialize Metal glass renderer if using custom implementation
+        if self.isUsingCustomGlassImpl {
+            if #available(iOS 13.0, *) {
+                self.setupMetalGlassLayer()
+            }
+        }
     }
     
     required public init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+    
+    deinit {
+        if #available(iOS 13.0, *) {
+            self.displayLink?.invalidate()
+            if self.isUsingCustomGlassImpl {
+                NotificationCenter.default.removeObserver(self)
+            }
+        }
+    }
+    
+    public override func willMove(toWindow newWindow: UIWindow?) {
+        super.willMove(toWindow: newWindow)
+        
+        if #available(iOS 13.0, *) {
+            if self.isUsingCustomGlassImpl {
+                print("🪟 willMove(toWindow:) - window: \(newWindow != nil ? "✅ attached" : "❌ detached")")
+                // Use smart visibility check instead of simple window check
+                updateDisplayLinkState()
+            }
+        }
+    }
+    
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        
+        if #available(iOS 13.0, *) {
+            if self.isUsingCustomGlassImpl {
+                // Check visibility when layout changes (e.g., view scrolls offscreen)
+                updateDisplayLinkState()
+            }
+        }
+    }
+    
+    // MARK: - Metal Glass Layer Setup (only used when useCustomGlassImpl = true)
+    
+    @available(iOS 13.0, *)
+    private func setupMetalGlassLayer() {
+        guard let renderer = MetalGlassRenderer() else {
+            return
+        }
+        self.metalGlassRenderer = renderer
+        
+        let metalLayer = CAMetalLayer()
+        renderer.configureLayer(metalLayer)
+        metalLayer.contentsScale = UIScreen.main.scale
+        
+        self.metalGlassLayer = metalLayer
+        
+        // Create reusable backdrop capturer with persistent buffers
+        // ✅ Share commandQueue with renderer to prevent GPU race condition
+        self.backdropCapturer = BackdropCapturer(
+            targetView: self,
+            device: renderer.device,
+            commandQueue: renderer.commandQueue,  // Shared queue ensures blit→render ordering
+            downsampleFactor: 1.0
+        )
+
+        // Add metal layer on top of blur but below content
+        if let backgroundNode = self.backgroundNode {
+            self.layer.insertSublayer(metalLayer, above: backgroundNode.view.layer)
+        }
+        
+        // Setup display link synchronized with CA render server
+        let displayLink = CADisplayLink(target: self, selector: #selector(self.displayLinkFired(_:)))
+        displayLink.add(to: .main, forMode: .common)
+        displayLink.isPaused = false
+        self.displayLink = displayLink
+        
+        // Monitor app state for battery saving
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(self.appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(self.appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+    }
+    
+    @available(iOS 13.0, *)
+    @objc private func displayLinkFired(_ displayLink: CADisplayLink) {
+        needsBackdropCapture = true
+        metalGlassLayer?.setNeedsDisplay()
+        renderBackdropIfNeeded()
+    }
+    
+    @available(iOS 13.0, *)
+    @objc private func appDidBecomeActive() {
+        isAppActive = true
+        updateDisplayLinkState()
+    }
+    
+    @available(iOS 13.0, *)
+    @objc private func appWillResignActive() {
+        isAppActive = false
+        updateDisplayLinkState()
+    }
+    
+    @available(iOS 13.0, *)
+    private func updateDisplayLinkState() {
+        // Smart visibility check:
+        // 1. App must be active (no background rendering!)
+        // 2. View must be in window
+        // 3. View must not be hidden
+        // 4. View must have non-zero alpha
+        // 5. View must not be clipped by ancestors (isViewVisibleInHierarchy handles this)
+        // 6. View must have non-zero on-screen bounds (detect offscreen views like TabBar scrolled away)
+        // let hasWindow = window != nil
+        // let notHidden = !isHidden
+        // let visibleAlpha = alpha > 0.01
+        // let visibleInHierarchy = isViewVisibleInHierarchy(self)
+        
+        // // Check if view is actually visible on screen (not scrolled offscreen)
+        // var isOnScreen = false
+        // if let window = window {
+        //     let viewFrameInWindow = convert(bounds, to: window)
+        //     let screenBounds = window.bounds
+        //     isOnScreen = viewFrameInWindow.intersects(screenBounds) && 
+        //                 viewFrameInWindow.width > 0 && 
+        //                 viewFrameInWindow.height > 0
+        // }
+        
+        // let shouldRender = isAppActive && 
+        //                   hasWindow && 
+        //                   notHidden && 
+        //                   visibleAlpha &&
+        //                   visibleInHierarchy &&
+        //                   isOnScreen
+        
+        // displayLink?.isPaused = !shouldRender
+    }
+    
+    @available(iOS 13.0, *)
+    private func renderBackdropIfNeeded() {
+        guard let metalLayer = self.metalGlassLayer,
+              let renderer = self.metalGlassRenderer,
+              let capturer = self.backdropCapturer else {
+            return
+        }
+        
+        needsBackdropCapture = false
+        
+        // Capture backdrop using layer.render approach
+        let backdropTexture = capturer.captureBackdrop()
+        
+        if backdropTexture == nil {
+            return
+        }
+        
+        // Render with captured backdrop (texture guaranteed non-nil here)
+        renderer.render(in: metalLayer, backdropTexture: backdropTexture)
+    }
+    
+    private var debugTextureSaved = false
+
+    @available(iOS 13.0, *)
+    private func updateMetalGlassLayer(size: CGSize, cornerRadius: CGFloat, isDark: Bool) {
+        guard let metalLayer = self.metalGlassLayer,
+              let renderer = self.metalGlassRenderer else {
+            return
+        }
+        
+        // Update layer frame
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.frame = CGRect(origin: .zero, size: size)
+        metalLayer.drawableSize = CGSize(
+            width: size.width * UIScreen.main.scale,
+            height: size.height * UIScreen.main.scale
+        )
+        metalLayer.cornerRadius = cornerRadius
+        metalLayer.masksToBounds = true
+        CATransaction.commit()
+        
+        // Update renderer configuration
+        renderer.updateConfiguration(MetalGlassRenderer.Configuration(
+            cornerRadius: cornerRadius,
+            isDark: isDark
+        ))
+        
+        // Update display link state based on visibility
+        updateDisplayLinkState()
+        
+        // Mark for immediate capture on next display refresh
+        self.needsBackdropCapture = true
     }
     
     override public func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
@@ -498,7 +732,7 @@ public class GlassBackgroundView: UIView {
             } else {
                 if let nativeParamsView = self.nativeParamsView, let nativeView = self.nativeView {
                     if #available(iOS 26.0, *) {
-                        let glassEffect = UIGlassEffect(style: .regular)
+                        let glassEffect = UIGlassEffect(style: .clear)
                         switch tintColor.kind {
                         case .panel:
                             glassEffect.tintColor = nil
@@ -536,6 +770,18 @@ public class GlassBackgroundView: UIView {
             transition.setFrame(view: shadowView, frame: CGRect(origin: CGPoint(), size: size).insetBy(dx: -shadowInset, dy: -shadowInset))
         }
         transition.setFrame(view: self.contentContainer, frame: CGRect(origin: CGPoint(), size: size))
+        
+        // Update Metal glass layer if using custom implementation
+        if self.isUsingCustomGlassImpl {
+            if #available(iOS 13.0, *) {
+                let cornerRadius: CGFloat
+                switch shape {
+                case let .roundedRect(radius):
+                    cornerRadius = radius
+                }
+                self.updateMetalGlassLayer(size: size, cornerRadius: cornerRadius, isDark: isDark)
+            }
+        }
     }
 }
 
