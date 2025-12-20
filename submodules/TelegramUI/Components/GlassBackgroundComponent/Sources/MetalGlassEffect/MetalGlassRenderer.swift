@@ -1,286 +1,308 @@
 import Foundation
 import UIKit
 import Metal
+import MetalPerformanceShaders
 import QuartzCore
 
 /// Metal-based renderer for custom glass effect
-/// Renders specular highlights and edge glow on top of blur layer
 @available(iOS 13.0, *)
 public final class MetalGlassRenderer {
-    
-    // MARK: - Metal Core Objects
-    
+
     private let _device: MTLDevice
     private let _commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private let samplerState: MTLSamplerState
+    private var uniformBuffer: MTLBuffer?
+    private var blurFilter: MPSImageGaussianBlur?
+    private var blurTexture: MTLTexture?
     
-    /// The Metal device used by this renderer
-    public var device: MTLDevice {
-        return self._device
-    }
-    
-    /// The Metal command queue (shared with BackdropCapturer to prevent GPU race)
-    public var commandQueue: MTLCommandQueue {
-        return self._commandQueue
-    }
-    
-    // MARK: - Uniform Buffer
+    public var device: MTLDevice { _device }
+    public var commandQueue: MTLCommandQueue { _commandQueue }
     
     private struct GlassUniforms {
         var viewSize: SIMD2<Float>
         var cornerRadius: Float
         var isDark: Float
+        var edgeWidth: Float
+        var distortionStrength: Float
+        var blurRadius: Float
+        var vars: SIMD4<Float>
     }
-    
-    private var uniformBuffer: MTLBuffer?
-    
-    // MARK: - Configuration
     
     public struct Configuration {
         public var cornerRadius: CGFloat
         public var isDark: Bool
-        
-        public init(cornerRadius: CGFloat = 0, isDark: Bool = false) {
+        public var edgeWidth: Float
+        public var distortionStrength: Float
+        public var blurRadius: Float
+        public var vars: SIMD4<Float>
+
+        public init(
+            cornerRadius: CGFloat = 0,
+            isDark: Bool = false,
+            edgeWidth: Float = 20.0,
+            distortionStrength: Float = 160.0,
+            // blurRadius: Float = 1.2, // Clear
+            blurRadius: Float = 1.44, // Regular
+            vars: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+        ) {
             self.cornerRadius = cornerRadius
             self.isDark = isDark
+            self.edgeWidth = edgeWidth
+            self.distortionStrength = distortionStrength
+            self.blurRadius = blurRadius
+            self.vars = vars
         }
     }
     
-    private var configuration: Configuration = Configuration()
-    
-    // MARK: - Initialization
-    
+    public private(set) var configuration = Configuration()
+
     public init?() {
-        // Get default Metal device
-        guard let device = MTLCreateSystemDefaultDevice() else {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue() else {
             return nil
         }
         self._device = device
-        
-        // Create command queue
-        guard let commandQueue = device.makeCommandQueue() else {
-            return nil
-        }
         self._commandQueue = commandQueue
-        
-        // Create uniform buffer
         self.uniformBuffer = device.makeBuffer(length: MemoryLayout<GlassUniforms>.size, options: .storageModeShared)
         
-        // Create texture sampler
-        let samplerDescriptor = MTLSamplerDescriptor()
-        samplerDescriptor.minFilter = .linear
-        samplerDescriptor.magFilter = .linear
-        samplerDescriptor.sAddressMode = .clampToEdge
-        samplerDescriptor.tAddressMode = .clampToEdge
-        guard let samplerState = device.makeSamplerState(descriptor: samplerDescriptor) else {
-            return nil
-        }
-        self.samplerState = samplerState
+        // Sampler
+        let samplerDesc = MTLSamplerDescriptor()
+        samplerDesc.minFilter = .linear
+        samplerDesc.magFilter = .linear
+        samplerDesc.sAddressMode = .clampToEdge
+        samplerDesc.tAddressMode = .clampToEdge
+        guard let sampler = device.makeSamplerState(descriptor: samplerDesc) else { return nil }
+        self.samplerState = sampler
         
-        // Load shader library
-        guard let library = Self.loadShaderLibrary(device: device) else {
-            return nil
-        }
-        
-        // Get shader functions
-        guard let vertexFunction = library.makeFunction(name: "glassVertexShader"),
-              let fragmentFunction = library.makeFunction(name: "glassFragmentShader") else {
+        // Shader
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+        } catch {
+            print("[MetalGlassRenderer] Shader compilation failed: \(error)")
             return nil
         }
         
-        // Create render pipeline
-        let pipelineDescriptor = MTLRenderPipelineDescriptor()
-        pipelineDescriptor.vertexFunction = vertexFunction
-        pipelineDescriptor.fragmentFunction = fragmentFunction
-        pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        guard let vertexFunc = library.makeFunction(name: "glassVertex"),
+              let fragmentFunc = library.makeFunction(name: "glassFragment") else {
+            print("[MetalGlassRenderer] Failed to load shader functions")
+            return nil
+        }
         
-        // Enable alpha blending for overlay effect
-        pipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-        pipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-        pipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-        pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-        pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        // Pipeline
+        let pipelineDesc = MTLRenderPipelineDescriptor()
+        pipelineDesc.vertexFunction = vertexFunc
+        pipelineDesc.fragmentFunction = fragmentFunc
+        pipelineDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        pipelineDesc.colorAttachments[0].isBlendingEnabled = true
+        pipelineDesc.colorAttachments[0].rgbBlendOperation = .add
+        pipelineDesc.colorAttachments[0].alphaBlendOperation = .add
+        pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         
         do {
-            self.pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            self.pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDesc)
         } catch {
+            print("[MetalGlassRenderer] Pipeline creation failed: \(error)")
             return nil
         }
     }
-    
-    // MARK: - Shader Loading
-    
-    private static func loadShaderLibrary(device: MTLDevice) -> MTLLibrary? {
-        // Compile shader from embedded source
-        // Note: Bazel doesn't compile .metal files, so we use runtime compilation
-        let shaderSource = Self.embeddedShaderSource()
-        do {
-            let library = try device.makeLibrary(source: shaderSource, options: nil)
-            return library
-        } catch {
-            print("[MetalGlassRenderer] Failed to compile shader: \(error)")
-            return nil
-        }
-    }
-    
-    /// Metal shader source (compiled at runtime since Bazel doesn't process .metal files)
-    private static func embeddedShaderSource() -> String {
-        return """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        // Uniforms passed from Swift
-        struct GlassUniforms {
-            float2 viewSize;       // Size in pixels
-            float cornerRadius;    // Corner radius in pixels
-            float isDark;          // 1.0 for dark mode, 0.0 for light mode
-        };
-        
-        struct VertexOut {
-            float4 position [[position]];
-            float2 texCoord;
-        };
-        
-        // Signed distance function for rounded rectangle
-        float sdRoundedRect(float2 pos, float2 halfSize, float radius) {
-            radius = min(radius, min(halfSize.x, halfSize.y));
-            float2 q = abs(pos) - halfSize + radius;
-            return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
-        }
-        
-        vertex VertexOut glassVertexShader(uint vertexID [[vertex_id]]) {
-            float2 positions[4] = {
-                float2(-1.0, -1.0),
-                float2( 1.0, -1.0),
-                float2(-1.0,  1.0),
-                float2( 1.0,  1.0)
-            };
-            
-            // CGContext captures with Y-down (UIKit coordinate system)
-            // So texture coordinates should match: (0,0) = top-left
-            float2 texCoords[4] = {
-                float2(0.0, 0.0),  // top-left
-                float2(1.0, 0.0),  // top-right
-                float2(0.0, 1.0),  // bottom-left
-                float2(1.0, 1.0)   // bottom-right
-            };
-            
-            VertexOut out;
-            out.position = float4(positions[vertexID], 0.0, 1.0);
-            out.texCoord = texCoords[vertexID];
-            return out;
-        }
-        
-        fragment float4 glassFragmentShader(VertexOut in [[stage_in]],
-                                            constant GlassUniforms& uniforms [[buffer(0)]],
-                                            texture2d<float> backdropTexture [[texture(0)]],
-                                            sampler textureSampler [[sampler(0)]]) {
-            
-            float2 size = uniforms.viewSize;
-            float radius = uniforms.cornerRadius;
-            
-            // Convert UV (0-1) to pixel coordinates centered at origin
-            float2 halfSize = size * 0.5;
-            float2 pos = in.texCoord * size - halfSize;
-            
-            // Signed distance to rounded rectangle edge (negative = inside)
-            float dist = sdRoundedRect(pos, halfSize, radius);
-            
-            // Skip pixels outside the shape
-            if (dist > 0.0) {
-                discard_fragment();
-            }
-            
-            // // DEBUG: Check if backdrop texture is available
-            float4 backdropColor = backdropTexture.sample(textureSampler, in.texCoord);
-            // Return backdrop directly (no tint) to see if it works
-            return backdropColor;
-        }
-        """
-    }
-    
-    // MARK: - Configuration
-    
+
     public func updateConfiguration(_ configuration: Configuration) {
         self.configuration = configuration
     }
     
-    // MARK: - Rendering
-    
-    /// Render glass effect into the given CAMetalLayer
-    /// - Parameters:
-    ///   - layer: The Metal layer to render into
-    ///   - backdropTexture: Optional backdrop texture to display behind glass effect
     public func render(in layer: CAMetalLayer, backdropTexture: MTLTexture? = nil) {
-        // CRITICAL: Shader requires backdropTexture, so skip rendering if nil
-        guard let backdropTexture = backdropTexture else {
-            return
+        guard let backdropTexture = backdropTexture,
+              let drawable = layer.nextDrawable(),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let uniformBuffer = self.uniformBuffer else { return }
+
+        var uniforms = GlassUniforms(
+            viewSize: SIMD2<Float>(Float(layer.drawableSize.width), Float(layer.drawableSize.height)),
+            cornerRadius: Float(configuration.cornerRadius * layer.contentsScale),
+            isDark: configuration.isDark ? 1.0 : 0.0,
+            edgeWidth: configuration.edgeWidth * Float(layer.contentsScale),
+            distortionStrength: configuration.distortionStrength,
+            blurRadius: configuration.blurRadius,
+            vars: configuration.vars
+        )
+        memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<GlassUniforms>.size)
+        
+        // Apply MPS Gaussian blur if needed
+        let textureToUse: MTLTexture
+        if configuration.blurRadius > 0.01 {
+            let blurSigma = Float(configuration.blurRadius)
+            if blurFilter?.sigma != blurSigma {
+                blurFilter = MPSImageGaussianBlur(device: _device, sigma: blurSigma)
+                blurFilter?.edgeMode = .clamp
+            }
+            
+            if blurTexture == nil || blurTexture!.width != backdropTexture.width || blurTexture!.height != backdropTexture.height {
+                let descriptor = MTLTextureDescriptor()
+                descriptor.textureType = .type2D
+                descriptor.width = backdropTexture.width
+                descriptor.height = backdropTexture.height
+                descriptor.pixelFormat = backdropTexture.pixelFormat
+                descriptor.storageMode = .private
+                descriptor.usage = [.shaderRead, .shaderWrite]
+                blurTexture = _device.makeTexture(descriptor: descriptor)
+            }
+            
+            if let blur = blurFilter, let blurred = blurTexture {
+                blur.encode(commandBuffer: commandBuffer, sourceTexture: backdropTexture, destinationTexture: blurred)
+                textureToUse = blurred
+            } else {
+                textureToUse = backdropTexture
+            }
+        } else {
+            textureToUse = backdropTexture
         }
         
-        guard let drawable = layer.nextDrawable() else {
-            return
-        }
+        let renderPass = MTLRenderPassDescriptor()
+        renderPass.colorAttachments[0].texture = drawable.texture
+        renderPass.colorAttachments[0].loadAction = .clear
+        renderPass.colorAttachments[0].storeAction = .store
+        renderPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            return
-        }
-        
-        // Update uniforms
-        if let uniformBuffer = self.uniformBuffer {
-            var uniforms = GlassUniforms(
-                viewSize: SIMD2<Float>(Float(layer.drawableSize.width), Float(layer.drawableSize.height)),
-                cornerRadius: Float(configuration.cornerRadius * layer.contentsScale),
-                isDark: configuration.isDark ? 1.0 : 0.0
-            )
-            memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<GlassUniforms>.size)
-        }
-        
-        let renderPassDescriptor = MTLRenderPassDescriptor()
-        renderPassDescriptor.colorAttachments[0].texture = drawable.texture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        renderPassDescriptor.colorAttachments[0].storeAction = .store
-        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-            return
-        }
-        
-        renderEncoder.setRenderPipelineState(pipelineState)
-        
-        // Set uniform buffer
-        if let uniformBuffer = self.uniformBuffer {
-            renderEncoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
-        }
-        
-        // Set backdrop texture (guaranteed to be non-nil here)
-        renderEncoder.setFragmentTexture(backdropTexture, index: 0)
-        renderEncoder.setFragmentSamplerState(samplerState, index: 0)
-        
-        // Draw full-screen quad (triangle strip with 4 vertices)
-        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        
-        renderEncoder.endEncoding()
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else { return }
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+        encoder.setFragmentTexture(textureToUse, index: 0)
+        encoder.setFragmentSamplerState(samplerState, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
         
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
     
-    // MARK: - Layer Setup
-    
-    /// Configure a CAMetalLayer for rendering
     public func configureLayer(_ layer: CAMetalLayer) {
         layer.device = _device
         layer.pixelFormat = .bgra8Unorm
         layer.isOpaque = false
         layer.framebufferOnly = true
-        
-        // Triple buffering для плавного рендеринга без разрывов
         layer.maximumDrawableCount = 3
-        
-        // Отображать как можно скорее без ожидания VSync
         layer.presentsWithTransaction = false
     }
+    
+    private static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    
+    struct Uniforms {
+        float2 viewSize;
+        float cornerRadius;
+        float isDark;  // 0.0 = light, 1.0 = dark
+        float edgeWidth;
+        float distortionStrength;
+        float blurRadius;
+        float4 vars;
+    };
+    
+    struct VertexOut {
+        float4 position [[position]];
+        float2 uv;
+    };
+    
+    // SDF for rounded rectangle
+    float sdfRoundRect(float2 p, float2 hs, float r) {
+        r = min(r, min(hs.x, hs.y));
+        float2 q = abs(p) - hs + r;
+        return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    }
+        
+    vertex VertexOut glassVertex(uint vid [[vertex_id]]) {
+        float2 pos[4] = { {-1,-1}, {1,-1}, {-1,1}, {1,1} };
+        float2 uv[4] = { {0,0}, {1,0}, {0,1}, {1,1} };
+        return { float4(pos[vid], 0, 1), uv[vid] };
+    }
+    
+    fragment float4 glassFragment(VertexOut in [[stage_in]],
+                                   constant Uniforms& u [[buffer(0)]],
+                                   texture2d<float> tex [[texture(0)]],
+                                   sampler s [[sampler(0)]]) {
+        float2 hs = u.viewSize * 0.5;
+        float2 p = in.uv * u.viewSize - hs;
+        float dist = sdfRoundRect(p, hs, u.cornerRadius);
+        
+        // Outside shape
+        if (dist > 0.0) discard_fragment();
+                
+        // Sample texture (blur already applied via MPS)
+        float4 color = tex.sample(s, in.uv);
+                
+        // Distortion
+        if (u.distortionStrength > 0.01) {
+            float edgeDist = -dist;
+            float norm = clamp(edgeDist / u.edgeWidth, 0.0, 1.0);
+            float lens = 1.0 - sqrt(max(0.0, 1.0 - pow(1.0 - norm, 2.0)));
+            
+            float2 e = float2(1.0, 0.0);
+            float2 grad = float2(
+                sdfRoundRect(p + e.xy, hs, u.cornerRadius) - sdfRoundRect(p - e.xy, hs, u.cornerRadius),
+                sdfRoundRect(p + e.yx, hs, u.cornerRadius) - sdfRoundRect(p - e.yx, hs, u.cornerRadius)
+            );
+            float2 n = normalize(grad);
+            float2 offset = n * lens * u.distortionStrength / u.viewSize;
+            
+            if (length(offset) > 0.001) {
+                float2 distUV = clamp(in.uv - offset, 0.0, 1.0);
+                color = tex.sample(s, distUV);
+            }
+        }
+
+        // Native liquid glass effect: per-channel lifting/lowering
+        // Working in linear RGB space for accurate color transformations
+        float3 lin = pow(color.rgb, float3(2.2));
+        
+        float3 result;
+        if (u.isDark > 0.5) {            
+            // Prevent pure black (min gray ~0.0035 in linear RGB)
+            float3 darkModeMinimumBrightness = max(0.0, 0.35 / 100.0);
+            result = mix(lin, darkModeMinimumBrightness, 0.8);
+        } else {
+            // Light mode: lift colors while preserving hue differences
+            // Reduce lift strength for already bright values to preserve visibility
+            float3 liftFactor = 0.5 + lin * 1.75;
+            
+            // Dampen lift for very bright values (>0.85 in linear RGB ≈ sRGB 240+)
+            float3 brightDampen = smoothstep(0, 1.0, lin);
+            liftFactor = mix(liftFactor, liftFactor * 0.3, brightDampen);
+            
+            float3 lifted = lin + (1.0 - lin) * liftFactor;
+            result = mix(lin, lifted, 0.8);
+        }
+        
+        // Convert back to sRGB
+        color.rgb = pow(clamp(result, 0.0, 1.0), float3(1.0/2.2));
+
+        // Edge glow
+        float edgeGlow = 1.0 - smoothstep(0.0, 2.5, -dist);
+        color.rgb += edgeGlow * (u.isDark > 0.5 ? 0.3 : 0.1);
+        
+        // // // === CLEAR STYLE ===
+        // // Use with others components later
+        // float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
+
+        // // Light mode: add veil
+        // float veilMask = smoothstep(0.05, 0.6, luma);
+        // color.rgb += 0.12 * veilMask;
+
+        // // Dark mode: boost darks
+        // float minC = min(color.r, min(color.g, color.b));
+        // float darkMask = 1.0 - smoothstep(0.15, 0.45, minC);
+        // float3 darkLift = float3(0.52);
+        // color.rgb = mix(color.rgb, darkLift, darkMask * 0.18);
+
+        // // Edge glow
+        // float edgeGlow = 1.0 - smoothstep(0.0, 4.0, -dist);
+        // color.rgb += edgeGlow * (u.isDark > 0.5 ? 0.06 : 0.03);
+        
+        return clamp(color, 0.0, 1.0);
+    }
+    """
 }
