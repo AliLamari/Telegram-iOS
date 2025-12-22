@@ -332,21 +332,8 @@ public class GlassBackgroundView: UIView {
 
     public static var useCustomGlassImpl: Bool = false
     
-    // Metal-based glass effect
-    private let customGlassView: UIView?
-    private var metalGlassLayer: CAMetalLayer?
-    private var metalGlassRenderer: MetalGlassRenderer?
-    private var backdropCapturer: BackdropCapturer?
-    private var needsBackdropCapture: Bool = false
-    
-    // Change detection
-    private var hierarchyTracker: HierarchyTrackingLayer?
-    private var runLoopObserver: CFRunLoopObserver?
-    private var lastRenderTime: CFTimeInterval = 0
-    private static let backdropThrottleFPS: Double = 60.0
-
-    // Lifecycle management
-    private var isAppActive: Bool = true
+    // Custom liquid glass view (encapsulates all Metal/Backdrop logic)
+    private let customLiquidGlassView: CustomLiquidGlassView?
     
     public override init(frame: CGRect) {
         if #available(iOS 26.0, *), !GlassBackgroundView.useCustomGlassImpl {
@@ -363,12 +350,11 @@ public class GlassBackgroundView: UIView {
             
             nativeParamsView.addSubview(nativeGlassView)
             
-            self.customGlassView = nil
+            self.customLiquidGlassView = nil
             self.foregroundView = nil
             self.shadowView = nil
         } else if #available(iOS 13.0, *), !GlassBackgroundView.useCustomGlassImpl {
-            // Custom Metal-based glass implementation (iOS 13+)
-            // Uses Metal layer for glass effect rendering
+            // Custom liquid glass implementation (iOS 13+)
             
             self.backgroundNode = nil
             self.nativeGlassView = nil
@@ -377,33 +363,16 @@ public class GlassBackgroundView: UIView {
             self.foregroundView = nil
             self.shadowView = nil
             
-            // Setup Metal glass renderer
-            let glassContainerView = UIView()
-            self.customGlassView = glassContainerView
-            
-            if let renderer = MetalGlassRenderer() {
-                self.metalGlassRenderer = renderer
-                
-                let metalLayer = CAMetalLayer()
-                renderer.configureLayer(metalLayer)
-                metalLayer.contentsScale = UIScreen.main.scale
-                self.metalGlassLayer = metalLayer
-                glassContainerView.layer.addSublayer(metalLayer)
-                
-                self.backdropCapturer = BackdropCapturer(
-                    targetView: glassContainerView,
-                    device: renderer.device,
-                    commandQueue: renderer.commandQueue,
-                    downsampleFactor: 0.25
-                )
-            }
+            // Create custom liquid glass view
+            let liquidGlass = CustomLiquidGlassView()
+            self.customLiquidGlassView = liquidGlass
         } else {
             let backgroundNode = NavigationBackgroundNode(color: .black, enableBlur: true, customBlurRadius: 8.0)
             self.backgroundNode = backgroundNode
             self.nativeGlassView = nil
             self.nativeGlassViewClippingContext = nil
             self.nativeParamsView = nil
-            self.customGlassView = nil
+            self.customLiquidGlassView = nil
             self.foregroundView = UIImageView()
             self.shadowView = UIImageView()
         }
@@ -424,8 +393,8 @@ public class GlassBackgroundView: UIView {
         if let shadowView = self.shadowView {
             self.addSubview(shadowView)
         }
-        if let customGlassView = self.customGlassView {
-            self.addSubview(customGlassView)
+        if let customLiquidGlassView = self.customLiquidGlassView {
+            self.addSubview(customLiquidGlassView)
         }
         if let nativeParamsView = self.nativeParamsView {
             self.addSubview(nativeParamsView)
@@ -438,89 +407,6 @@ public class GlassBackgroundView: UIView {
             foregroundView.mask = self.maskContainerView
         }
         self.addSubview(self.contentContainer)
-        
-        // Setup change detection for custom glass (iOS 13+)
-        if self.customGlassView != nil {
-            self.setupChangeDetection()
-        }
-    }
-    
-    private func setupChangeDetection() {
-        // Setup notification observers
-        // TODO: check if we need with HierarchyTrackingLayer being present
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(self.appDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(self.appWillResignActive),
-            name: UIApplication.willResignActiveNotification,
-            object: nil
-        )
-        
-        // HierarchyTrackingLayer - detects when view enters/exits hierarchy
-        let tracker = HierarchyTrackingLayer()
-        self.hierarchyTracker = tracker
-        self.layer.addSublayer(tracker)
-
-        // tracker.didEnterHierarchy = { [weak self] in
-        // DEBUG IF NEEDED
-        // }
-        
-        // tracker.didExitHierarchy = { [weak self] in
-        // DEBUG IF NEEDED
-        // }
-        
-        // CFRunLoopObserver - fires before CA commits transactions
-        var lastFPSTime: CFTimeInterval = CACurrentMediaTime()
-        var frameCount = 0
-        let minRenderInterval = 1.0 / GlassBackgroundView.backdropThrottleFPS
-        
-        let observer = CFRunLoopObserverCreateWithHandler(
-            kCFAllocatorDefault,
-            CFRunLoopActivity.beforeWaiting.rawValue,
-            true,
-            0
-        ) { [weak self] _, _ in
-            frameCount += 1
-            let currentTime = CACurrentMediaTime()
-            let delta = currentTime - lastFPSTime
-            
-            // FPS logging
-            if delta >= 1.0 {
-                // DEBUG IF NEEDED
-                // let fps = Double(frameCount) / delta
-                // print("[RunLoopObserver] FPS: \(String(format: "%.1f", fps)) (\(frameCount) events in \(String(format: "%.2f", delta))s)")
-                lastFPSTime = currentTime
-                frameCount = 0
-            }
-            
-            // Throttling: render only if enough time passed since last render
-            guard let self = self else { return }
-            if currentTime - self.lastRenderTime >= minRenderInterval {
-                self.needsBackdropCapture = true
-                self.renderBackdropIfNeeded()
-                self.lastRenderTime = currentTime
-            }
-        }
-        
-        if let observer = observer {
-            CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
-            self.runLoopObserver = observer
-        }
-    }
-    
-    @objc private func appDidBecomeActive() {
-        isAppActive = true
-        // Optimization: here
-    }
-    
-    @objc private func appWillResignActive() {
-        isAppActive = false
-        // Optimization: here
     }
     
     required public init?(coder: NSCoder) {
@@ -528,61 +414,10 @@ public class GlassBackgroundView: UIView {
     }
     
     deinit {
-        if self.customGlassView != nil {
-            NotificationCenter.default.removeObserver(self)
-            
-            // Cleanup CFRunLoopObserver
-            if let observer = self.runLoopObserver {
-                CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
-            }
-        }
+        // Explicitly remove customLiquidGlassView to stop RunLoopObserver
+        customLiquidGlassView?.removeFromSuperview()
     }
-    
-    private func renderBackdropIfNeeded() {
-        guard let metalLayer = self.metalGlassLayer,
-              let renderer = self.metalGlassRenderer,
-              let capturer = self.backdropCapturer else {
-            return
-        }
-        
-        needsBackdropCapture = false
-        let backdropTexture = capturer.captureBackdrop()
-        
-        if backdropTexture == nil {
-            return
-        }
-        renderer.render(in: metalLayer, backdropTexture: backdropTexture)
-    }
-    private func updateMetalGlassLayer(size: CGSize, cornerRadius: CGFloat, isDark: Bool) {
-        guard let customGlassView = self.customGlassView,
-              let metalLayer = self.metalGlassLayer,
-              let renderer = self.metalGlassRenderer else {
-            return
-        }
-        
-        // Update container view and layer frame
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        customGlassView.frame = CGRect(origin: .zero, size: size)
-        metalLayer.frame = CGRect(origin: .zero, size: size)
-        metalLayer.drawableSize = CGSize(
-            width: size.width * UIScreen.main.scale,
-            height: size.height * UIScreen.main.scale
-        )
-        metalLayer.cornerRadius = cornerRadius
-        metalLayer.masksToBounds = true
-        CATransaction.commit()
-        
-        // Update renderer configuration
-        renderer.updateConfiguration(MetalGlassRenderer.Configuration(
-            cornerRadius: cornerRadius,
-            isDark: isDark
-        ))
-        
-        // Mark for immediate capture on next display refresh
-        self.needsBackdropCapture = true
-    }
-    
+
     override public func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if let nativeGlassView = self.nativeGlassView {
             if let result = nativeGlassView.hitTest(self.convert(point, to: nativeGlassView), with: event) {
@@ -731,14 +566,19 @@ public class GlassBackgroundView: UIView {
         }
         transition.setFrame(view: self.contentContainer, frame: CGRect(origin: CGPoint(), size: size))
         
-        // Update Metal glass layer if using custom implementation
-        if self.customGlassView != nil {
+        // Update custom liquid glass if using custom implementation
+        if let customLiquidGlassView = self.customLiquidGlassView {
             let cornerRadius: CGFloat
             switch shape {
             case let .roundedRect(radius):
                 cornerRadius = radius
             }
-            self.updateMetalGlassLayer(size: size, cornerRadius: cornerRadius, isDark: isDark)
+            
+            transition.setFrame(view: customLiquidGlassView, frame: CGRect(origin: CGPoint(), size: size))
+            customLiquidGlassView.updateConfiguration(CustomLiquidGlassView.Configuration(
+                cornerRadius: cornerRadius,
+                isDark: isDark
+            ))
         }
     }
 }
