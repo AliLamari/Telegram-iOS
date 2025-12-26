@@ -306,6 +306,19 @@ public final class MetalKnobGlassRenderer {
             color.rgb += 0.03 * veilMask;  // Subtle 5% veil on bright areas
         }
         
+        // Inner shadow from bottom (glass darkening effect)
+        float normalizedY = in.uv.y;  // 0 at top, 1 at bottom
+        float shadowHeight = 0.5;  // Shadow extends to half of height
+        if (normalizedY > (1.0 - shadowHeight)) {
+            // Gradient from bottom to half height
+            float shadowFactor = (normalizedY - (1.0 - shadowHeight)) / shadowHeight;
+            shadowFactor = pow(shadowFactor, 1.5);  // Smooth falloff
+            
+            // Darker for light mode, subtle for dark mode
+            float shadowStrength = u.isDark > 0.5 ? 0.08 : 0.15;
+            color.rgb *= (1.0 - shadowFactor * shadowStrength);
+        }
+        
         // Directional edge glow (iOS 26 style) - rim lighting based on view direction
         float edgeDist = -dist;
         float edgeGlow = smoothstep(12.0, 0.0, edgeDist);  // Wider rim for blue

@@ -353,9 +353,9 @@ public class GlassBackgroundView: UIView {
             self.customLiquidGlassView = nil
             self.foregroundView = nil
             self.shadowView = nil
-        } else if #available(iOS 13.0, *), !GlassBackgroundView.useCustomGlassImpl {
+        } else if #available(iOS 13.0, *), GlassBackgroundView.useCustomGlassImpl {
             // Custom liquid glass implementation (iOS 13+)
-            
+
             self.backgroundNode = nil
             self.nativeGlassView = nil
             self.nativeGlassViewClippingContext = nil

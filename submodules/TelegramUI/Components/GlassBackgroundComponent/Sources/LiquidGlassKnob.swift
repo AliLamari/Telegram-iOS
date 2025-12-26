@@ -34,6 +34,9 @@ public final class LiquidGlassKnob: UIView {
     public private(set) var isActive: Bool = false
     private var squeeze: CGFloat = 1.0
     
+    private var lastRenderTime: CFTimeInterval = 0
+    private let renderThrottle: CFTimeInterval = 1.0 / 120.0
+    
     private var inactiveWhiteLayer: CALayer?
     
     private var containerWidth: CGFloat { configuration.size * 2 }
@@ -179,6 +182,10 @@ public final class LiquidGlassKnob: UIView {
     
     @objc private func displayLinkFired() {
         guard isRenderingActive else { return }
+        
+        let currentTime = CACurrentMediaTime()
+        guard currentTime - lastRenderTime >= renderThrottle else { return }
+        
         renderFrame()
     }
     
@@ -289,6 +296,7 @@ public final class LiquidGlassKnob: UIView {
             return
         }
         
+        lastRenderTime = CACurrentMediaTime()
         guard let backdropTexture = captureBackdropTexture() else {
             return
         }
@@ -350,7 +358,10 @@ public final class LiquidGlassKnob: UIView {
     }
     
     public func renderNow() {
-        renderFrame()
+        let currentTime = CACurrentMediaTime()
+        if currentTime - lastRenderTime >= renderThrottle {
+            renderFrame()
+        }
     }
     
     public func setActive(_ active: Bool) {
