@@ -1,3 +1,18 @@
+# Custom Liquid Glass Implementation
+- Implemented pipeline for capturing backdrop -> rendering on to "glass" layer -> Metal shader processing (distortion, edge glow, etc.)
+- Theoretically(according to API), it can run at as low iOS version as 9.0 (could not download less than 15.0 version of iOS)
+
+Currently only TabBar Background and Slider has glass effect.
+A lot of time took trying to make it more efficient, but seems like it is not achievable. Backdrop capturing seems like a major bottleneck in iOS.
+In order to make it at least somehow efficient, used LoopObserver, that has as low as 5 FPS on static screen, but even one animated emoji will make it again goes to 60FPS(throttle).
+But then issue with multiple elements on screen (like chat view):
+- Tried to have one shared backdrop capturer, but then a complexity added as need to pass elements to hide and then to crop... + need to handle logic with elements positioning for drop-like effect (when 2 or more elements goes closer or futher). 
+My personal thought is that it is waay to complex for feature that is not that essential + as I could not find way for it to be eficient enough
+So, in the end, I implemented ios26 like glass and used it in TabBar background asa well as other one for slider knob.
+
+Anyway, it's my first ever iOS project, so I wish that more experienced developers can find a way to make it work
+
+
 # Telegram iOS Source Code Compilation Guide
 
 We welcome all developers to use our API and source code to create applications on our platform.
