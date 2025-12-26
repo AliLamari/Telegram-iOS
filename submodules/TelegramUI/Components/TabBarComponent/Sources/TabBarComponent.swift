@@ -87,7 +87,7 @@ public final class TabBarComponent: Component {
         
         private var component: TabBarComponent?
         private weak var state: EmptyComponentState?
-        
+
         public override init(frame: CGRect) {
             self.backgroundView = GlassBackgroundView()
             self.selectionView = GlassBackgroundView.ContentImageView()

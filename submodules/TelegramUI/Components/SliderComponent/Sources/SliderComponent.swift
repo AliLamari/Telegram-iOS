@@ -5,6 +5,7 @@ import AsyncDisplayKit
 import TelegramPresentationData
 import LegacyComponents
 import ComponentFlow
+import GlassBackgroundComponent
 
 public final class SliderComponent: Component {
     public final class Discrete: Equatable {
@@ -118,13 +119,33 @@ public final class SliderComponent: Component {
     }
     
     final class SliderView: UISlider {
+        var onTouchBegan: (() -> Void)?
+        var onTouchEnded: (() -> Void)?
         
+        override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+            onTouchBegan?()
+            return super.beginTracking(touch, with: event)
+        }
+        
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesEnded(touches, with: event)
+            onTouchEnded?()
+        }
+        
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesCancelled(touches, with: event)
+            onTouchEnded?()
+        }
     }
     
     public final class View: UIView {
         private var nativeSliderView: SliderView?
         private var sliderView: TGPhotoEditorSliderView?
-        
+        private var customGlassSliderView: SliderView?
+        private var glassKnob: LiquidGlassKnob?
+        private var lastKnobPosition: CGFloat = 0.0
+        private var lastKnobUpdateTime: CFTimeInterval = 0.0
+        private var knobVelocity: CGFloat = 0.0
         private var component: SliderComponent?
         private weak var state: EmptyComponentState?
         
@@ -188,6 +209,75 @@ public final class SliderComponent: Component {
                 sliderView.maximumTrackTintColor = component.trackBackgroundColor
                 
                 transition.setFrame(view: sliderView, frame: CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: availableSize.width, height: 44.0)))
+            } else if #available(iOS 13.0, *), component.useNative {
+                // Custom Glass Slider (UISlider with LiquidGlassView knob - iOS 13-25)
+                let customSliderView: SliderView
+                let knobSize: CGFloat = component.knobSize ?? 28.0
+                
+                if let current = self.customGlassSliderView {
+                    customSliderView = current
+                } else {
+                    customSliderView = SliderView()
+                    customSliderView.disablesInteractiveTransitionGestureRecognizer = true
+                    customSliderView.addTarget(self, action: #selector(self.sliderValueChanged), for: .valueChanged)
+                    customSliderView.layer.allowsGroupOpacity = true
+                    
+                    switch component.content {
+                    case let .continuous(continuous):
+                        customSliderView.minimumValue = Float(continuous.minValue ?? 0.0)
+                        customSliderView.maximumValue = 1.0
+                    case let .discrete(discrete):
+                        customSliderView.minimumValue = 0.0
+                        customSliderView.maximumValue = Float(discrete.valueCount - 1)
+                    }
+
+                    customSliderView.setThumbImage(UIImage(), for: .normal)
+                    customSliderView.setThumbImage(UIImage(), for: .highlighted)
+                    
+                    self.addSubview(customSliderView)
+                    self.customGlassSliderView = customSliderView
+
+                    let knobConfig = LiquidGlassKnob.Configuration(
+                        size: knobSize,
+                        isDark: false
+                    )
+                    let glassKnob = LiquidGlassKnob(configuration: knobConfig)
+                    self.glassKnob = glassKnob
+
+                    self.addSubview(glassKnob)
+                }
+                
+                customSliderView.onTouchBegan = { [weak self, weak glassKnob] in
+                    guard let self = self, let glassKnob = glassKnob else { return }
+                    self.lastKnobUpdateTime = CACurrentMediaTime()
+                    glassKnob.setActive(true)
+                }
+                
+                customSliderView.onTouchEnded = { [weak self, weak glassKnob] in
+                    guard let self = self, let glassKnob = glassKnob else { return }
+                    self.knobVelocity = 0.0
+                    glassKnob.setSqueeze(1.0)
+                    glassKnob.setActive(false)
+                }
+                
+                switch component.content {
+                case let .continuous(continuous):
+                    customSliderView.value = Float(continuous.value)
+                case let .discrete(discrete):
+                    customSliderView.value = Float(discrete.value)
+                }
+                
+                customSliderView.minimumTrackTintColor = component.trackForegroundColor
+                customSliderView.maximumTrackTintColor = component.trackBackgroundColor
+
+                if let glassKnob = self.glassKnob {
+                    let sliderFrame = CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: availableSize.width, height: 44.0))
+                    let trackRect = customSliderView.trackRect(forBounds: sliderFrame)
+                    let thumbRect = customSliderView.thumbRect(forBounds: sliderFrame, trackRect: trackRect, value: customSliderView.value)
+                    glassKnob.center = CGPoint(x: thumbRect.midX, y: thumbRect.midY)
+                }
+                
+                transition.setFrame(view: customSliderView, frame: CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: availableSize.width, height: 44.0)))
             } else {
                 var internalIsTrackingUpdated: ((Bool) -> Void)?
                 if let isTrackingUpdated = component.isTrackingUpdated {
@@ -304,14 +394,43 @@ public final class SliderComponent: Component {
             guard let component = self.component else {
                 return
             }
+
+            if let customSliderView = self.customGlassSliderView, let glassKnob = self.glassKnob {
+                let sliderFrame = customSliderView.frame
+                let trackRect = customSliderView.trackRect(forBounds: sliderFrame)
+                let thumbRect = customSliderView.thumbRect(forBounds: sliderFrame, trackRect: trackRect, value: customSliderView.value)
+                let newPosition = thumbRect.midX
+
+                let currentTime = CACurrentMediaTime()
+                let timeDelta = currentTime - lastKnobUpdateTime
+                if timeDelta > 0 {
+                    let positionDelta = abs(newPosition - lastKnobPosition)
+                    knobVelocity = positionDelta / CGFloat(timeDelta)
+                }
+                lastKnobPosition = newPosition
+                lastKnobUpdateTime = currentTime
+
+                let maxVelocity: CGFloat = 600.0
+                let velocityFactor = min(knobVelocity / maxVelocity, 1.0)
+                let squeeze = 1.0 - (velocityFactor * 0.3)
+
+                glassKnob.center = CGPoint(x: thumbRect.midX, y: thumbRect.midY)
+                glassKnob.setSqueeze(squeeze)
+
+                glassKnob.renderNow()
+            }
+
             let floatValue: CGFloat
             if let sliderView = self.sliderView {
                 floatValue = sliderView.value
             } else if let nativeSliderView = self.nativeSliderView {
                 floatValue = CGFloat(nativeSliderView.value)
+            } else if let customGlassSliderView = self.customGlassSliderView {
+                floatValue = CGFloat(customGlassSliderView.value)
             } else {
                 return
             }
+
             switch component.content {
             case let .discrete(discrete):
                 discrete.valueUpdated(Int(floatValue))
