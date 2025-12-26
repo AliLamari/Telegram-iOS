@@ -5,7 +5,7 @@ import MetalPerformanceShaders
 import QuartzCore
 
 /// Metal-based renderer for custom glass effect
-@available(iOS 13.0, *)
+@available(iOS 9.0, *)
 public final class MetalGlassRenderer {
 
     private let _device: MTLDevice

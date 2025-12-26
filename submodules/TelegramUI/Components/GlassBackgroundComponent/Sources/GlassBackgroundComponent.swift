@@ -353,17 +353,15 @@ public class GlassBackgroundView: UIView {
             self.customLiquidGlassView = nil
             self.foregroundView = nil
             self.shadowView = nil
-        } else if #available(iOS 13.0, *), GlassBackgroundView.useCustomGlassImpl {
-            // Custom liquid glass implementation (iOS 13+)
-
+        } else if #available(iOS 9.0, *), GlassBackgroundView.useCustomGlassImpl {
+            // Custom liquid glass implementation (iOS 9+)
             self.backgroundNode = nil
             self.nativeGlassView = nil
             self.nativeGlassViewClippingContext = nil
             self.nativeParamsView = nil
             self.foregroundView = nil
             self.shadowView = nil
-            
-            // Create custom liquid glass view
+
             let liquidGlass = CustomLiquidGlassView()
             self.customLiquidGlassView = liquidGlass
         } else {
@@ -393,14 +391,14 @@ public class GlassBackgroundView: UIView {
         if let shadowView = self.shadowView {
             self.addSubview(shadowView)
         }
-        if let customLiquidGlassView = self.customLiquidGlassView {
-            self.addSubview(customLiquidGlassView)
-        }
         if let nativeParamsView = self.nativeParamsView {
             self.addSubview(nativeParamsView)
         }
         if let backgroundNode = self.backgroundNode {
             self.addSubview(backgroundNode.view)
+        }
+        if let customLiquidGlassView = self.customLiquidGlassView {
+            self.addSubview(customLiquidGlassView)
         }
         if let foregroundView = self.foregroundView {
             self.addSubview(foregroundView)
@@ -414,7 +412,6 @@ public class GlassBackgroundView: UIView {
     }
     
     deinit {
-        // Explicitly remove customLiquidGlassView to stop RunLoopObserver
         customLiquidGlassView?.removeFromSuperview()
     }
 

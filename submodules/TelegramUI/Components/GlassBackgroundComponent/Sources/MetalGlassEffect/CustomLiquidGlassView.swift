@@ -9,7 +9,7 @@ import HierarchyTrackingLayer
 /// Use if 1-2 layers of glass effect are on screen simultaneously.
 /// Pros: low latency, good quality, access to direct backdrop texture
 
-@available(iOS 13.0, *)
+@available(iOS 9.0, *)
 public final class CustomLiquidGlassView: UIView {
     
     public struct Configuration: Equatable {

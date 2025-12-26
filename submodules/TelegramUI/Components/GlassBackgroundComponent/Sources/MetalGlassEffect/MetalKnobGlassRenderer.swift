@@ -4,7 +4,7 @@ import Metal
 import MetalPerformanceShaders
 import QuartzCore
 
-@available(iOS 13.0, *)
+@available(iOS 9.0, *)
 public final class MetalKnobGlassRenderer {
 
     private let _device: MTLDevice
@@ -25,6 +25,7 @@ public final class MetalKnobGlassRenderer {
         var edgeWidth: Float
         var distortionStrength: Float
         var blurRadius: Float
+        var padding: Float = 0.0
     }
     
     public struct Configuration {
@@ -78,8 +79,8 @@ public final class MetalKnobGlassRenderer {
             return nil
         }
         
-        guard let vertexFunc = library.makeFunction(name: "glassVertex"),
-              let fragmentFunc = library.makeFunction(name: "glassFragment") else {
+        guard let vertexFunc = library.makeFunction(name: "knobGlassVertex"),
+              let fragmentFunc = library.makeFunction(name: "knobGlassFragment") else {
             print("[MetalKnobGlassRenderer] Failed to load shader functions")
             return nil
         }
@@ -193,6 +194,7 @@ public final class MetalKnobGlassRenderer {
         float edgeWidth;
         float distortionStrength;
         float blurRadius;
+        float padding;  // Align to 32 bytes
     };
     
     struct VertexOut {
@@ -207,13 +209,13 @@ public final class MetalKnobGlassRenderer {
         return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
     }
         
-    vertex VertexOut glassVertex(uint vid [[vertex_id]]) {
+    vertex VertexOut knobGlassVertex(uint vid [[vertex_id]]) {
         float2 pos[4] = { {-1,-1}, {1,-1}, {-1,1}, {1,1} };
         float2 uv[4] = { {0,0}, {1,0}, {0,1}, {1,1} };
         return { float4(pos[vid], 0, 1), uv[vid] };
     }
     
-    fragment float4 glassFragment(VertexOut in [[stage_in]],
+    fragment float4 knobGlassFragment(VertexOut in [[stage_in]],
                                    constant Uniforms& u [[buffer(0)]],
                                    texture2d<float> tex [[texture(0)]],
                                    sampler s [[sampler(0)]]) {

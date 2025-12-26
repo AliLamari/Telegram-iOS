@@ -3,7 +3,7 @@ import UIKit
 import Metal
 import QuartzCore
 
-@available(iOS 13.0, *)
+@available(iOS 9.0, *)
 public final class LiquidGlassKnob: UIView {
     
     public struct Configuration {
